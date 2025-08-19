@@ -1,8 +1,56 @@
 debugger;
-console.log("[sandbox] script loaded, parent is:", window.parent);
-// sandbox.js
-window.parent.postMessage({ __fromSandbox: true, type: 'sandbox-ready' }, '*');
-console.log("sandbox am here (handshake sent)");
+console.log('[sandbox] test start, parent:', window.parent);
+try {
+  console.log('[sandbox] document.domain:', document.domain);
+} catch(e) { console.error('[sandbox] document.domain err', e); }
+try {
+  document.cookie = 'sandbox_test=1; SameSite=None; Secure'; // try to set a cookie
+  console.log('[sandbox] set cookie OK');
+} catch(e) {
+  console.error('[sandbox] set cookie error', e);
+}
+try {
+  const c = document.cookie;
+  console.log('[sandbox] read cookie:', c);
+} catch(e) {
+  console.error('[sandbox] read cookie error', e);
+}
+
+
+window.addEventListener('message', (ev) => {
+  try {
+    console.log("[sandbox] incoming message:", ev.data, "origin:", ev.origin, "from parent?", ev.source === window.parent);
+    const d = ev.data || {};
+
+    // respond to ping with token
+    if (d && d.type === 'sandbox-ping' && d.token) {
+      try {
+        window.parent.postMessage({ type: 'sandbox-pong', token: d.token, __fromSandbox: true }, '*');
+        console.log("[sandbox] replied pong for token", d.token);
+      } catch (e) {
+        console.error("[sandbox] failed to post pong", e);
+      }
+      // ensure port handler is installed (idempotent)
+      if (typeof installPortHandler === 'function' && !window.__portHandlerInstalled) {
+        installPortHandler();
+        window.__portHandlerInstalled = true;
+      }
+      return;
+    }
+
+    // optional legacy ready: if parent asked for 'sandbox-ready', reply
+    if (d && d.type === 'sandbox-ready') {
+      try {
+        window.parent.postMessage({ __fromSandbox: true, type: 'sandbox-ready' }, '*');
+        console.log("[sandbox] replied legacy-ready");
+      } catch (e) { console.error(e); }
+      return;
+    }
+
+  } catch (e) {
+    console.error("[sandbox] message handler error", e);
+  }
+});
 
 /* exported gapiLoaded */
 /* exported gisLoaded */
@@ -86,8 +134,6 @@ if (token !== null) {
     // document.getElementById('signout_button').style.visibility = 'hidden';
 }
 
-const functionProvided = {gapiLoaded, gisLoaded, handleAuthClick, handleSignoutClick};
-
 window.onerror = function(msg, src, line, col, err) {
   console.error("[sandbox] runtime error:", msg, { src, line, col, err });
   // also notify parent so offscreen can surface errors
@@ -138,3 +184,83 @@ window.addEventListener('message', async (event) => {
 //   return true;
 // });
 }
+
+const functionProvided = {gapiLoaded, gisLoaded, handleAuthClick, handleSignoutClick};
+
+
+// installPortHandler must be defined later in the file (or inline here).
+// It should install a message listener that grabs event.ports[0] and handles requests.
+// sandbox.js — robust port handler
+function installPortHandler() {
+  // guard to avoid double install
+  if (window.__portHandlerInstalled) return;
+  window.__portHandlerInstalled = true;
+
+  window.addEventListener('message', (event) => {
+    try {
+      // Log raw message and ports for debugging
+      console.log('[sandbox] incoming message:', event.data, 'origin:', event.origin, 'portsLength:', (event.ports && event.ports.length));
+      const { data, ports } = event;
+      const port = ports && ports[0];
+
+      if (!port) {
+        console.warn('[sandbox] No MessagePort transferred with message — data:', data);
+        return;
+      }
+
+      // Start port (safe to call even if already started)
+      try { port.start && port.start(); } catch (e) { console.warn('[sandbox] port.start threw', e); }
+
+      // Helper to safely post back on port
+      const safePost = (msg) => {
+        try {
+          port.postMessage(msg);
+        } catch (e) {
+          console.error('[sandbox] port.postMessage failed', e, 'msg:', msg);
+        }
+      };
+
+      // If the caller expects us to receive messages on the port, set onmessage handler
+      port.onmessage = (pe) => {
+        console.log('[sandbox] port.onmessage received (unlikely for one-shot):', pe.data);
+      };
+      port.onmessageerror = (err) => {
+        console.warn('[sandbox] port.onmessageerror', err);
+      };
+
+      // Execute requested command and reply on the port
+      (async () => {
+        try {
+          const cmd = data && data.cmd;
+          if (!cmd) {
+            safePost({ success: false, error: 'missing cmd' });
+            try { port.close(); } catch (e) {}
+            return;
+          }
+
+          const fn = (functionProvided && functionProvided[cmd]);
+          if (typeof fn !== 'function') {
+            safePost({ success: false, error: `Unknown command: ${String(cmd)}` });
+            try { port.close(); } catch (e) {}
+            return;
+          }
+
+          const args = Array.isArray(data.args) ? data.args : (data.arg === undefined ? [] : [data.arg]);
+          console.log('[sandbox] calling', cmd, 'with', args);
+          const result = await fn.apply(null, args);
+          safePost({ success: true, result });
+        } catch (err) {
+          console.error('[sandbox] error executing fn', err);
+          safePost({ success: false, error: err && err.message ? err.message : String(err) });
+        } finally {
+          try { port.close(); } catch (e) { /* ignore */ }
+        }
+      })();
+
+    } catch (outerErr) {
+      console.error('[sandbox] unexpected error in message handler', outerErr);
+    }
+  });
+}
+
+
